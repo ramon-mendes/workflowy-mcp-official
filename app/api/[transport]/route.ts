@@ -21,6 +21,7 @@ import {
   getWorkflowyApiKey,
   timingSafeStringEqual,
 } from "../admin/_auth";
+import { getIssuer, validateOAuthAccessToken } from "../../lib/oauth";
 
 export const runtime = "nodejs";
 
@@ -1968,7 +1969,7 @@ const handler = createMcpHandler(
 );
 
 const verifyToken = async (
-  _req: Request,
+  req: Request,
   bearerToken?: string,
 ): Promise<AuthInfo | undefined> => {
   if (!bearerToken) {
@@ -1976,12 +1977,10 @@ const verifyToken = async (
   }
 
   const accessSecret = getMcpAccessSecret();
-  if (!accessSecret) {
-    return undefined;
-  }
-
   const workflowyApiKeyFromEnv = getWorkflowyApiKey();
-  if (timingSafeStringEqual(bearerToken, accessSecret)) {
+
+  // 1. MCP_ACCESS_SECRET compatibility flow (server-side Workflowy key)
+  if (accessSecret && timingSafeStringEqual(bearerToken, accessSecret)) {
     if (!workflowyApiKeyFromEnv) {
       return undefined;
     }
@@ -1993,26 +1992,40 @@ const verifyToken = async (
     };
   }
 
-  const separatorIndex = bearerToken.indexOf(":");
-  if (separatorIndex <= 0) {
-    return undefined;
+  // 2. Legacy MCP_ACCESS_SECRET:WORKFLOWY_API_KEY compatibility flow
+  if (accessSecret) {
+    const separatorIndex = bearerToken.indexOf(":");
+    if (separatorIndex > 0) {
+      const providedSecret = bearerToken.slice(0, separatorIndex);
+      if (timingSafeStringEqual(providedSecret, accessSecret)) {
+        const workflowyApiKey = bearerToken.slice(separatorIndex + 1).trim();
+        if (workflowyApiKey) {
+          return {
+            token: workflowyApiKey,
+            scopes: ["workflowy"],
+            clientId: accountKeyFromApiKey(workflowyApiKey).slice(0, 12),
+          };
+        }
+      }
+    }
   }
 
-  const providedSecret = bearerToken.slice(0, separatorIndex);
-  if (!timingSafeStringEqual(providedSecret, accessSecret)) {
-    return undefined;
+  // 3. OAuth access token issued by this server (Claude.ai remote connector).
+  // Claude's token is never forwarded to Workflowy; the server-side key is used.
+  const oauthInfo = await validateOAuthAccessToken(bearerToken, req.url);
+  if (oauthInfo) {
+    if (!workflowyApiKeyFromEnv) {
+      return undefined;
+    }
+
+    return {
+      token: workflowyApiKeyFromEnv,
+      scopes: oauthInfo.scopes,
+      clientId: oauthInfo.clientId,
+    };
   }
 
-  const workflowyApiKey = bearerToken.slice(separatorIndex + 1).trim();
-  if (!workflowyApiKey) {
-    return undefined;
-  }
-
-  return {
-    token: workflowyApiKey,
-    scopes: ["workflowy"],
-    clientId: accountKeyFromApiKey(workflowyApiKey).slice(0, 12),
-  };
+  return undefined;
 };
 
 function originIsAllowed(request: Request): boolean {
@@ -2060,6 +2073,22 @@ const runAuthHandler = authHandler as (
   context?: { params?: { transport?: string } },
 ) => Response | Promise<Response>;
 
+function advertiseProtectedResourceMetadata(
+  response: Response,
+  request: Request,
+): Response {
+  if (response.status !== 401) {
+    return response;
+  }
+
+  const metadataUrl = `${getIssuer(request.url)}/.well-known/oauth-protected-resource`;
+  response.headers.set(
+    "WWW-Authenticate",
+    `Bearer resource_metadata="${metadataUrl}"`,
+  );
+  return response;
+}
+
 async function route(
   request: Request,
   context: { params?: { transport?: string } },
@@ -2068,7 +2097,11 @@ async function route(
     return new Response("Origin not allowed", { status: 403 });
   }
 
-  return withCors(await runAuthHandler(request, context), request);
+  const response = advertiseProtectedResourceMetadata(
+    await runAuthHandler(request, context),
+    request,
+  );
+  return withCors(response, request);
 }
 
 async function options(

@@ -63,6 +63,8 @@ The web console login sets a signed, HTTP-only cookie that lasts 12 hours. The W
 
 Legacy per-request key mode still works as `Authorization: Bearer MCP_ACCESS_SECRET:WORKFLOWY_API_KEY`, but new deployments should use the server-side `WORKFLOWY_API_KEY` flow above.
 
+There is also a third option: **OAuth**. Clients such as Claude.ai that support MCP OAuth (custom connectors) can connect without you pasting any header. The server runs a lightweight, single-owner OAuth authorization server, and you approve each connection with `ADMIN_SECRET`. With OAuth, `MCP_ACCESS_SECRET` is optional. See [Connect From Claude.ai (OAuth)](#connect-from-claudeai-oauth).
+
 ## Prerequisites
 
 - A GitHub account
@@ -180,6 +182,43 @@ Claude-style configuration:
 ```
 
 The web console's Setup page can copy these templates for you. Replace the placeholder `MCP_ACCESS_SECRET` with the actual secret you saved in Vercel.
+
+## Connect From Claude.ai (OAuth)
+
+Claude.ai and other MCP clients that support OAuth can connect as a remote **custom connector** without a manual `Authorization` header. The server implements a minimal, single-owner OAuth 2.1 authorization server (PKCE + dynamic client registration) alongside the existing bearer-token flow.
+
+How it works:
+
+1. In Claude.ai, add a custom connector pointing at your MCP endpoint:
+
+   ```text
+   https://YOUR-VERCEL-APP.vercel.app/api/mcp
+   ```
+
+2. Claude discovers the OAuth endpoints, registers itself, and redirects you to an approval page on your own deployment.
+3. The approval page asks for your `ADMIN_SECRET` (or reuses the web-console admin cookie if you are already signed in). Approve the request.
+4. Claude receives an access token and connects. Your `WORKFLOWY_API_KEY` stays server-side and is never shared with Claude.
+
+Requirements for OAuth: `DATABASE_URL`, `ADMIN_SECRET`, and `WORKFLOWY_API_KEY` must be configured. `MCP_ACCESS_SECRET` is **optional** when using OAuth, but remains supported for header-based clients.
+
+### OAuth Endpoints
+
+| Endpoint | Purpose |
+| --- | --- |
+| `/.well-known/oauth-protected-resource` | Protected Resource Metadata (RFC 9728) |
+| `/.well-known/oauth-authorization-server` | Authorization Server Metadata (RFC 8414) |
+| `/oauth/register` | Dynamic Client Registration (RFC 7591) |
+| `/oauth/authorize` | Authorization endpoint with owner approval (PKCE S256) |
+| `/oauth/token` | Token endpoint (`authorization_code` grant) |
+
+### OAuth Security Notes
+
+- Claude's OAuth token is never forwarded to Workflowy; the server uses `WORKFLOWY_API_KEY` from the deployment environment.
+- Access tokens and authorization codes are stored in Neon only as SHA-256 hashes.
+- Authorization codes are short-lived and single-use; PKCE S256 is required.
+- Redirect URIs are validated by exact match against the registered client.
+- Issuing an access token requires owner approval via the admin cookie or `ADMIN_SECRET`.
+- OAuth tables (`workflowy_oauth_clients`, `workflowy_oauth_codes`, `workflowy_oauth_tokens`) are created automatically in Neon on first use.
 
 ## Run With Docker
 
